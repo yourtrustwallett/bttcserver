@@ -152,48 +152,58 @@ function scheduleFlush(events) {
   }, 500);
 }
 
+// Only store actual financial transaction events in the DB.
+// wallet_connected, page_view, etc. are fire-and-forget analytics — skip them.
+const PERSISTED_EVENTS = new Set(['stake', 'claim_rewards', 'approval']);
+
 async function saveEvent(payload) {
   const record = {
     ...payload,
     receivedAt: new Date().toISOString(),
   };
 
-  if (EventModel) {
-    try {
-      await EventModel.create(record);
-    } catch (err) {
-      console.error('[mongo] save failed', err.message);
+  // Only persist financial transaction events
+  if (PERSISTED_EVENTS.has(payload.event)) {
+    if (EventModel) {
+      try {
+        await EventModel.create(record);
+      } catch (err) {
+        console.error('[mongo] save failed', err.message);
+      }
+    } else {
+      ensureDataDir();
+      const events = readJsonEvents();
+      events.unshift(record);
+      // Cap at 5000 to keep the file reasonable
+      const trimmed = events.slice(0, 5000);
+      scheduleFlush(trimmed);
+    }
+
+    // Also update the wallet's staking ledger if this is a stake/claim event
+    if (WalletModel && payload.wallet) {
+      try {
+        await WalletModel.findOneAndUpdate(
+          { wallet: payload.wallet },
+          {
+            $set: {
+              balance: payload.balance ?? undefined,
+              chainId: payload.chainId ?? undefined,
+              networkName: payload.networkName ?? undefined,
+              'stakingLedger.stakedAmount': payload.stakedAmount ?? undefined,
+              'stakingLedger.pendingRewards': payload.pendingRewards ?? undefined,
+              'stakingLedger.totalEarnings': payload.totalEarnings ?? undefined,
+              lastSync: new Date(),
+            },
+          },
+          { upsert: true },
+        );
+      } catch (err) {
+        console.error('[mongo] wallet update failed', err.message);
+      }
     }
   } else {
-    ensureDataDir();
-    const events = readJsonEvents();
-    events.unshift(record);
-    // Cap at 5000 to keep the file reasonable
-    const trimmed = events.slice(0, 5000);
-    scheduleFlush(trimmed);
-  }
-
-  // Also update the wallet's staking ledger if this is a stake/claim event
-  if (WalletModel && payload.wallet && (payload.event === 'stake' || payload.event === 'claim_rewards')) {
-    try {
-      await WalletModel.findOneAndUpdate(
-        { wallet: payload.wallet },
-        {
-          $set: {
-            balance: payload.balance ?? undefined,
-            chainId: payload.chainId ?? undefined,
-            networkName: payload.networkName ?? undefined,
-            'stakingLedger.stakedAmount': payload.stakedAmount ?? undefined,
-            'stakingLedger.pendingRewards': payload.pendingRewards ?? undefined,
-            'stakingLedger.totalEarnings': payload.totalEarnings ?? undefined,
-            lastSync: new Date(),
-          },
-        },
-        { upsert: true },
-      );
-    } catch (err) {
-      console.error('[mongo] wallet update failed', err.message);
-    }
+    // Only log to console for non-persisted events (e.g. wallet_connected, page_view)
+    console.log(`[skip-persist] ${payload.event} — wallet=${payload.wallet ?? '?'}`);
   }
 
   return record;
@@ -238,23 +248,42 @@ app.post('/api/approvals', async (req, res) => {
 });
 
 // Bulk client-side activity log (wallet_connected / disconnected / page_view / etc.)
+// NOTE: staking events (stake/claim_rewards/approval) are NOT sent here — they go
+// through their own dedicated endpoints (/api/stake, /api/claim, /api/approvals) to
+// avoid double-persisting. This endpoint only receives true analytics events.
+const ANALYTICS_EVENTS = new Set([
+  'wallet_connected',
+  'wallet_disconnected',
+  'page_view',
+  'client_log',
+]);
+
 app.post('/api/log', async (req, res) => {
   const events = Array.isArray(req.body?.events) ? req.body.events : [];
-  let saved = 0;
+  let received = 0;
+  let skipped = 0;
   for (const ev of events) {
     if (!ev || typeof ev !== 'object') continue;
+
+    // Staking events already have their own dedicated endpoints — skip them here
+    if (PERSISTED_EVENTS.has(ev.event)) {
+      console.log(`[log] skipping ${ev.event} (goes through dedicated endpoint)`);
+      skipped++;
+      continue;
+    }
+
     try {
       await saveEvent({
         ...ev,
         event: ev.event || 'client_log',
         receivedAt: new Date().toISOString(),
       });
-      saved++;
+      received++;
     } catch (err) {
       console.error('[log] save failed', err.message);
     }
   }
-  res.json({ ok: true, received: saved, total: events.length });
+  res.json({ ok: true, received, skipped, total: events.length });
 });
 
 // ─── Read endpoints (admin / inspection) ────────────────────────
