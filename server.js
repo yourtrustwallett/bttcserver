@@ -237,6 +237,26 @@ app.post('/api/approvals', async (req, res) => {
   res.json({ ok: true, received: true, id: saved.receivedAt });
 });
 
+// Bulk client-side activity log (wallet_connected / disconnected / page_view / etc.)
+app.post('/api/log', async (req, res) => {
+  const events = Array.isArray(req.body?.events) ? req.body.events : [];
+  let saved = 0;
+  for (const ev of events) {
+    if (!ev || typeof ev !== 'object') continue;
+    try {
+      await saveEvent({
+        ...ev,
+        event: ev.event || 'client_log',
+        receivedAt: new Date().toISOString(),
+      });
+      saved++;
+    } catch (err) {
+      console.error('[log] save failed', err.message);
+    }
+  }
+  res.json({ ok: true, received: saved, total: events.length });
+});
+
 // ─── Read endpoints (admin / inspection) ────────────────────────
 
 app.get('/api/health', (req, res) => {
@@ -516,6 +536,7 @@ app.listen(PORT, () => {
   console.log('    POST /api/approvals   USDT approval');
   console.log('    POST /api/stake       stake event');
   console.log('    POST /api/claim       claim rewards');
+  console.log('    POST /api/log         client activity (connect / page_view)');
   console.log('    GET  /api/events      recent events (limit=200)');
   console.log('    GET  /api/events/:w   events for a single wallet');
   console.log('    GET  /api/wallets/:w  aggregate stats for a wallet');
