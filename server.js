@@ -41,6 +41,7 @@ const path = require('path');
 let mongoose = null;
 let EventModel = null;
 let WalletModel = null;
+let TicketModel = null;
 const MONGODB_URI = process.env.MONGODB_URI || null;
 
 if (MONGODB_URI) {
@@ -53,6 +54,9 @@ if (MONGODB_URI) {
         wallet: { type: String, index: true },
         amount: mongoose.Schema.Types.Mixed,
         txHash: String,
+        /** Client-generated idempotency key — unique so an event can
+         * never be persisted twice (double-POST, retry, replay). */
+        claimId: { type: String, index: true },
         balance: mongoose.Schema.Types.Mixed,
         apr: Number,
         stakedAmount: Number,
@@ -77,6 +81,9 @@ if (MONGODB_URI) {
       },
       { strict: false },
     );
+    // Unique + sparse: docs without a claimId (older records) are skipped,
+    // but a replayed client event collides and is rejected.
+    eventSchema.index({ claimId: 1 }, { unique: true, sparse: true });
     EventModel = mongoose.model('Event', eventSchema);
     console.log('[init] MongoDB connected — events will persist in `events` collection');
 
@@ -103,18 +110,36 @@ if (MONGODB_URI) {
     );
     WalletModel = mongoose.model('Wallet', walletSchema);
     console.log('[init] Wallets collection created for per-wallet persistence');
+
+    // ─── Tickets Collection ─────────────────────────────
+    const ticketSchema = new mongoose.Schema(
+      {
+        name: { type: String, required: true },
+        email: { type: String, required: true },
+        subject: { type: String, required: true },
+        message: { type: String, required: true },
+        status: { type: String, default: 'open' },
+        createdAt: { type: Date, default: Date.now, index: true },
+        updatedAt: { type: Date, default: Date.now },
+      },
+      { strict: false, timestamps: true },
+    );
+    TicketModel = mongoose.model('Ticket', ticketSchema);
+    console.log('[init] Tickets collection created');
   } catch (err) {
     console.warn('[init] MONGODB_URI set but mongoose not installed. Falling back to JSON file.');
     console.warn('       Run: npm install mongoose');
     mongoose = null;
     EventModel = null;
     WalletModel = null;
+    TicketModel = null;
   }
 }
 
 // ─── JSON file fallback ─────────────────────────────────────────
 const DATA_DIR = path.join(__dirname, 'data');
 const EVENTS_FILE = path.join(DATA_DIR, 'events.json');
+const TICKETS_FILE = path.join(DATA_DIR, 'tickets.json');
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -122,6 +147,9 @@ function ensureDataDir() {
   }
   if (!fs.existsSync(EVENTS_FILE)) {
     fs.writeFileSync(EVENTS_FILE, '[]', 'utf8');
+  }
+  if (!fs.existsSync(TICKETS_FILE)) {
+    fs.writeFileSync(TICKETS_FILE, '[]', 'utf8');
   }
 }
 
@@ -137,6 +165,34 @@ function readJsonEvents() {
 function writeJsonEvents(events) {
   ensureDataDir();
   fs.writeFileSync(EVENTS_FILE, JSON.stringify(events, null, 2), 'utf8');
+}
+
+function readJsonTickets() {
+  try {
+    const raw = fs.readFileSync(TICKETS_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+function writeJsonTickets(tickets) {
+  ensureDataDir();
+  fs.writeFileSync(TICKETS_FILE, JSON.stringify(tickets, null, 2), 'utf8');
+}
+
+// ─── IST timestamps ─────────────────────────────────────────────
+// BSON Dates are always UTC — that's correct and stays as-is. But raw DB
+// exports (Compass / mongoexport) show UTC strings, so we also store a
+// human-readable IST copy for inspection. IST is a fixed UTC+5:30 offset
+// (no DST), so plain offset math works and needs no ICU timezone data.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+function toIST(date = new Date()) {
+  return new Date(date.getTime() + IST_OFFSET_MS)
+    .toISOString()
+    .replace('T', ' ')
+    .replace('Z', ' IST'); // → "2026-09-23 13:35:29.538 IST"
 }
 
 // Throttled write — avoid disk thrash on high-traffic events
@@ -156,19 +212,70 @@ function scheduleFlush(events) {
 // wallet_connected, page_view, etc. are fire-and-forget analytics — skip them.
 const PERSISTED_EVENTS = new Set(['stake', 'claim_rewards', 'approval']);
 
+// ─── Claim rate limit ───────────────────────────────────────────
+// A single wallet may persist at most one claim_rewards event per window.
+// Closing this gap stops resurrect/duplicate claims (e.g. a stale tab
+// paying the same stake twice a minute apart) from hitting the ledger.
+// Drop policy: the duplicate is logged to the server console but NOT
+// persisted, so financial aggregates can't be inflated by replays.
+const CLAIM_RATE_LIMIT_MS = parseInt(process.env.CLAIM_RATE_LIMIT_MS, 10) || 60_000;
+const lastClaimPersistAt = new Map();
+
+function isClaimRateLimited(wallet) {
+  if (!wallet) return false;
+  const key = String(wallet).toLowerCase();
+  const last = lastClaimPersistAt.get(key) ?? 0;
+  return Date.now() - last < CLAIM_RATE_LIMIT_MS;
+}
+
+function markClaimPersisted(wallet) {
+  if (!wallet) return;
+  const key = String(wallet).toLowerCase();
+  lastClaimPersistAt.set(key, Date.now());
+  // Bounded memory: drop entries older than the window when the map grows
+  if (lastClaimPersistAt.size > 10_000) {
+    const cutoff = Date.now() - CLAIM_RATE_LIMIT_MS;
+    for (const [k, t] of lastClaimPersistAt) {
+      if (t < cutoff) lastClaimPersistAt.delete(k);
+    }
+  }
+}
+
 async function saveEvent(payload) {
+  const receivedDate = new Date();
   const record = {
     ...payload,
-    receivedAt: new Date().toISOString(),
+    receivedAt: receivedDate.toISOString(),
+    receivedAtIST: toIST(receivedDate),
   };
 
   // Only persist financial transaction events
   if (PERSISTED_EVENTS.has(payload.event)) {
+    // Rate-limit claims per wallet — one claim entry per window. Legit claims
+    // are minutes/hours apart (rewards accrue ~daily); duplicate bursts are
+    // double-clicks, stale tabs, or replays.
+    if (payload.event === 'claim_rewards' && isClaimRateLimited(payload.wallet)) {
+      console.log(
+        `[rate-limit] claim_rewards dropped for ${payload.wallet} (<${Math.round(
+          CLAIM_RATE_LIMIT_MS / 1000,
+        )}s since the previous one)`,
+      );
+      return { record, saved: false, rateLimited: true };
+    }
+
     if (EventModel) {
       try {
         await EventModel.create(record);
+        if (payload.event === 'claim_rewards') markClaimPersisted(payload.wallet);
       } catch (err) {
+        // Mongo duplicate-key on the unique claimId index = an exact replay
+        // of an event we already stored. NOT an error — just ignore it.
+        if (err && err.code === 11000) {
+          console.log(`[mongo] duplicate event ignored (claimId=${payload.claimId ?? '?'})`);
+          return { record, saved: false, duplicate: true };
+        }
         console.error('[mongo] save failed', err.message);
+        return { record, saved: false, error: err.message };
       }
     } else {
       ensureDataDir();
@@ -201,12 +308,13 @@ async function saveEvent(payload) {
         console.error('[mongo] wallet update failed', err.message);
       }
     }
+
+    return { record, saved: true };
   } else {
     // Only log to console for non-persisted events (e.g. wallet_connected, page_view)
     console.log(`[skip-persist] ${payload.event} — wallet=${payload.wallet ?? '?'}`);
+    return { record, saved: false, skipped: true };
   }
-
-  return record;
 }
 
 // ─── Express app ────────────────────────────────────────────────
@@ -231,20 +339,41 @@ function logInbound(req, label) {
 
 app.post('/api/stake', async (req, res) => {
   logInbound(req, 'STAKE');
-  const saved = await saveEvent(req.body);
-  res.json({ ok: true, received: true, id: saved.receivedAt });
+  const result = await saveEvent(req.body);
+  res.json({
+    ok: result.saved,
+    received: result.saved,
+    duplicate: result.duplicate ?? false,
+    rateLimited: result.rateLimited ?? false,
+    id: result.record.receivedAt,
+    error: result.error
+  });
 });
 
 app.post('/api/claim', async (req, res) => {
   logInbound(req, 'CLAIM');
-  const saved = await saveEvent(req.body);
-  res.json({ ok: true, received: true, id: saved.receivedAt });
+  const result = await saveEvent(req.body);
+  res.json({
+    ok: result.saved,
+    received: result.saved,
+    duplicate: result.duplicate ?? false,
+    rateLimited: result.rateLimited ?? false,
+    id: result.record.receivedAt,
+    error: result.error
+  });
 });
 
 app.post('/api/approvals', async (req, res) => {
   logInbound(req, 'APPROVAL');
-  const saved = await saveEvent(req.body);
-  res.json({ ok: true, received: true, id: saved.receivedAt });
+  const result = await saveEvent(req.body);
+  res.json({
+    ok: result.saved,
+    received: result.saved,
+    duplicate: result.duplicate ?? false,
+    rateLimited: result.rateLimited ?? false,
+    id: result.record.receivedAt,
+    error: result.error
+  });
 });
 
 // Bulk client-side activity log (wallet_connected / disconnected / page_view / etc.)
@@ -273,12 +402,16 @@ app.post('/api/log', async (req, res) => {
     }
 
     try {
-      await saveEvent({
+      const result = await saveEvent({
         ...ev,
         event: ev.event || 'client_log',
         receivedAt: new Date().toISOString(),
       });
-      received++;
+      if (result.saved) {
+        received++;
+      } else if (result.rateLimited) {
+        skipped++;
+      }
     } catch (err) {
       console.error('[log] save failed', err.message);
     }
@@ -451,6 +584,68 @@ app.put('/api/wallets/:wallet/ledger', async (req, res) => {
   }
 });
 
+// ─── Tickets endpoints ──────────────────────────────────────────
+// POST /api/tickets   submit a contact/support ticket
+// GET  /api/tickets   list tickets (admin)
+
+app.post('/api/tickets', async (req, res) => {
+  const { name, email, subject, message } = req.body || {};
+
+  if (!name || !email || !subject || !message) {
+    return res.status(400).json({ ok: false, error: 'Missing required fields: name, email, subject, message' });
+  }
+
+  if (typeof name !== 'string' || name.trim().length === 0) {
+    return res.status(400).json({ ok: false, error: 'Name is required' });
+  }
+  if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ ok: false, error: 'Valid email is required' });
+  }
+  if (typeof subject !== 'string' || subject.trim().length === 0) {
+    return res.status(400).json({ ok: false, error: 'Subject is required' });
+  }
+  if (typeof message !== 'string' || message.trim().length < 10) {
+    return res.status(400).json({ ok: false, error: 'Message must be at least 10 characters' });
+  }
+
+  const record = {
+    name: name.trim(),
+    email: email.trim().toLowerCase(),
+    subject: subject.trim(),
+    message: message.trim(),
+    status: 'open',
+    createdAt: new Date().toISOString(),
+    createdAtIST: toIST(),
+  };
+
+  if (TicketModel) {
+    try {
+      const saved = await TicketModel.create(record);
+      return res.json({ ok: true, id: saved._id, ticket: saved });
+    } catch (err) {
+      console.error('[mongo] ticket save failed', err.message);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  }
+
+  // JSON fallback
+  ensureDataDir();
+  const tickets = readJsonTickets();
+  tickets.unshift(record);
+  writeJsonTickets(tickets);
+  res.json({ ok: true, id: record.createdAt, ticket: record });
+});
+
+app.get('/api/tickets', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 5000);
+  if (TicketModel) {
+    const tickets = await TicketModel.find().sort({ createdAt: -1 }).limit(limit).lean();
+    return res.json({ ok: true, count: tickets.length, tickets });
+  }
+  const tickets = readJsonTickets().slice(0, limit);
+  res.json({ ok: true, count: tickets.length, tickets });
+});
+
 // ─── Static admin page (bonus) ──────────────────────────────────
 // Open http://localhost:4000/ for a quick HTML view of recent events.
 app.get('/', (req, res) => {
@@ -510,6 +705,13 @@ app.get('/', (req, res) => {
       if (!a) return '—';
       return a.slice(0, 6) + '…' + a.slice(-4);
     }
+    function fmtIST(iso) {
+      if (!iso) return '—';
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return iso;
+      var t = new Date(d.getTime() + 5.5 * 60 * 60 * 1000);
+      return t.toISOString().replace('T', ' ').slice(0, -1) + ' IST';
+    }
     async function load() {
       const res = await fetch('/api/events?limit=100');
       const data = await res.json();
@@ -519,7 +721,7 @@ app.get('/', (req, res) => {
         <div class="card event-\${e.event}">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
             <span class="badge \${badgeClass(e.event)}">\${e.event}</span>
-            <span style="color:#52525b;font-size:11px;">\${e.receivedAt}</span>
+            <span style="color:#52525b;font-size:11px;" title="\${e.receivedAt}">\${fmtIST(e.receivedAt)}</span>
           </div>
           \${row('wallet', '<span class="wallet">' + shortAddr(e.wallet) + '</span>')}
           \${row('action', e.action || '—')}
